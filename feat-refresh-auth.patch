@@ -1,0 +1,645 @@
+From f835002bcd07c5b2cb22a543a583ce90a27816f7 Mon Sep 17 00:00:00 2001
+From: student <s@s>
+Date: Wed, 28 Oct 2026 16:14:54 +0000
+Subject: [PATCH] feat: refresh token auth, /auth/me, requireAuth for POST
+ /posts
+
+---
+ .gitignore                              |  2 +
+ package.json                            |  8 ++-
+ src/app.ts                              | 19 +++++-
+ src/config.ts                           |  7 +++
+ src/domain/post/entity.ts               |  2 +-
+ src/domain/user/entity.ts               |  5 ++
+ src/domain/user/repository.ts           |  6 ++
+ src/repositories/post.ts                | 10 ++--
+ src/repositories/user.ts                | 22 +++++++
+ src/routers/auth.ts                     | 13 ++++
+ src/routers/post.ts                     |  5 +-
+ src/services/auth.ts                    | 50 ++++++++++++++++
+ src/services/token.ts                   | 39 ++++++++++++
+ src/services/types/auth.ts              | 15 +++++
+ src/services/types/token.ts             |  6 ++
+ src/transport/dto/auth.ts               |  4 ++
+ src/transport/dto/post.ts               |  5 +-
+ src/transport/handlers/auth.ts          | 79 +++++++++++++++++++++++++
+ src/transport/handlers/post.ts          | 30 +++++-----
+ src/transport/middleware/requireAuth.ts | 23 +++++++
+ src/utils/password.ts                   | 17 ++++++
+ 21 files changed, 341 insertions(+), 26 deletions(-)
+ create mode 100644 src/config.ts
+ create mode 100644 src/domain/user/entity.ts
+ create mode 100644 src/domain/user/repository.ts
+ create mode 100644 src/repositories/user.ts
+ create mode 100644 src/routers/auth.ts
+ create mode 100644 src/services/auth.ts
+ create mode 100644 src/services/token.ts
+ create mode 100644 src/services/types/auth.ts
+ create mode 100644 src/services/types/token.ts
+ create mode 100644 src/transport/dto/auth.ts
+ create mode 100644 src/transport/handlers/auth.ts
+ create mode 100644 src/transport/middleware/requireAuth.ts
+ create mode 100644 src/utils/password.ts
+
+diff --git a/.gitignore b/.gitignore
+index 3c3629e..9c97bbd 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,3 @@
+ node_modules
++dist
++.env
+diff --git a/package.json b/package.json
+index 1b87b47..363b8fe 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "forum-api",
+   "version": "1.0.0",
+-  "description": "Forum API: posts",
++  "description": "Forum API: posts and auth",
+   "main": "dist/app.js",
+   "type": "module",
+   "scripts": {
+@@ -11,10 +11,14 @@
+     "check": "tsc --noEmit"
+   },
+   "dependencies": {
+-    "express": "^5.2.1"
++    "cookie-parser": "^1.4.7",
++    "express": "^5.2.1",
++    "jsonwebtoken": "^9.0.2"
+   },
+   "devDependencies": {
++    "@types/cookie-parser": "^1.4.9",
+     "@types/express": "^5.0.5",
++    "@types/jsonwebtoken": "^9.0.10",
+     "@types/node": "^24.10.1",
+     "ts-node": "^10.9.2",
+     "typescript": "^5.9.3"
+diff --git a/src/app.ts b/src/app.ts
+index 3d640e2..df6c7ff 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,20 +1,37 @@
+ import express from "express";
++import cookieParser from "cookie-parser";
+ import { createPostRepository } from "./repositories/post.js";
++import { createUserRepository } from "./repositories/user.js";
+ import { createPostService } from "./services/post.js";
++import { createTokenService } from "./services/token.js";
++import { createAuthService } from "./services/auth.js";
+ import { createPostHandlers } from "./transport/handlers/post.js";
++import { createAuthHandlers } from "./transport/handlers/auth.js";
++import { createRequireAuth } from "./transport/middleware/requireAuth.js";
+ import { createPostRouter } from "./routers/post.js";
++import { createAuthRouter } from "./routers/auth.js";
+ 
+ const app = express();
+ const PORT = 3000;
+ 
+ app.use(express.json());
++app.use(cookieParser());
+ 
+ // composition root: тут збираємо всі залежності
++const tokenService = createTokenService();
++const requireAuth = createRequireAuth(tokenService);
++
++const userRepository = createUserRepository();
++const authService = createAuthService(userRepository, tokenService);
++const authHandlers = createAuthHandlers(authService);
++const authRouter = createAuthRouter(authHandlers, requireAuth);
++
+ const postRepository = createPostRepository();
+ const postService = createPostService(postRepository);
+ const postHandlers = createPostHandlers(postService);
+-const postRouter = createPostRouter(postHandlers);
++const postRouter = createPostRouter(postHandlers, requireAuth);
+ 
++app.use("/auth", authRouter);
+ app.use("/posts", postRouter);
+ 
+ app.listen(PORT, () => {
+diff --git a/src/config.ts b/src/config.ts
+new file mode 100644
+index 0000000..5a33750
+--- /dev/null
++++ b/src/config.ts
+@@ -0,0 +1,7 @@
++export const config = {
++  isProduction: process.env.NODE_ENV === "production",
++  accessSecret: process.env.JWT_ACCESS_SECRET || "access-secret",
++  refreshSecret: process.env.JWT_REFRESH_SECRET || "refresh-secret",
++  accessTtl: 15 * 60,
++  refreshTtl: 7 * 24 * 60 * 60,
++};
+diff --git a/src/domain/post/entity.ts b/src/domain/post/entity.ts
+index 48daf8d..f55d0c1 100644
+--- a/src/domain/post/entity.ts
++++ b/src/domain/post/entity.ts
+@@ -2,6 +2,6 @@ export type Post = {
+   id: number;
+   title: string;
+   content: string;
+-  author: string;
++  authorId: number;
+   category: string;
+ };
+diff --git a/src/domain/user/entity.ts b/src/domain/user/entity.ts
+new file mode 100644
+index 0000000..dfa4584
+--- /dev/null
++++ b/src/domain/user/entity.ts
+@@ -0,0 +1,5 @@
++export type User = {
++  id: number;
++  email: string;
++  passwordHash: string;
++};
+diff --git a/src/domain/user/repository.ts b/src/domain/user/repository.ts
+new file mode 100644
+index 0000000..a184edd
+--- /dev/null
++++ b/src/domain/user/repository.ts
+@@ -0,0 +1,6 @@
++import type { User } from "./entity.js";
++
++export interface UserRepository {
++  getById(id: number): User | undefined;
++  getByEmail(email: string): User | undefined;
++}
+diff --git a/src/repositories/post.ts b/src/repositories/post.ts
+index e0822d0..5325f25 100644
+--- a/src/repositories/post.ts
++++ b/src/repositories/post.ts
+@@ -7,21 +7,21 @@ export const createPostRepository = (): Repository => {
+       id: 1,
+       title: "How to start with JavaScript",
+       content: "Some useful tips for beginners.",
+-      author: "Alex",
++      authorId: 1,
+       category: "programming",
+     },
+     {
+       id: 2,
+       title: "My first API",
+       content: "I created my first API with Express.",
+-      author: "Maria",
++      authorId: 2,
+       category: "programming",
+     },
+     {
+       id: 3,
+       title: "Best books to read",
+       content: "A few books I recommend.",
+-      author: "John",
++      authorId: 3,
+       category: "books",
+     },
+   ];
+@@ -52,7 +52,7 @@ export const createPostRepository = (): Repository => {
+       id: nextId,
+       title: data.title,
+       content: data.content,
+-      author: data.author,
++      authorId: data.authorId,
+       category: data.category,
+     };
+ 
+@@ -72,7 +72,7 @@ export const createPostRepository = (): Repository => {
+       id: id,
+       title: data.title,
+       content: data.content,
+-      author: data.author,
++      authorId: data.authorId,
+       category: data.category,
+     };
+ 
+diff --git a/src/repositories/user.ts b/src/repositories/user.ts
+new file mode 100644
+index 0000000..5c4469d
+--- /dev/null
++++ b/src/repositories/user.ts
+@@ -0,0 +1,22 @@
++import type { User } from "../domain/user/entity.js";
++import type { UserRepository } from "../domain/user/repository.js";
++import { hashPassword } from "../utils/password.js";
++
++export const createUserRepository = (): UserRepository => {
++  // пароль у всіх: password123
++  const users: User[] = [
++    { id: 1, email: "alex@example.com", passwordHash: hashPassword("password123") },
++    { id: 2, email: "maria@example.com", passwordHash: hashPassword("password123") },
++    { id: 3, email: "john@example.com", passwordHash: hashPassword("password123") },
++  ];
++
++  const getById = (id: number): User | undefined => {
++    return users.find((user) => user.id === id);
++  };
++
++  const getByEmail = (email: string): User | undefined => {
++    return users.find((user) => user.email === email);
++  };
++
++  return { getById, getByEmail };
++};
+diff --git a/src/routers/auth.ts b/src/routers/auth.ts
+new file mode 100644
+index 0000000..49f009c
+--- /dev/null
++++ b/src/routers/auth.ts
+@@ -0,0 +1,13 @@
++import { Router } from "express";
++import type { RequestHandler } from "express";
++import type { AuthHandlers } from "../transport/handlers/auth.js";
++
++export const createAuthRouter = (handlers: AuthHandlers, requireAuth: RequestHandler): Router => {
++  const router = Router();
++
++  router.post("/login", handlers.login);
++  router.post("/refresh", handlers.refresh);
++  router.get("/me", requireAuth, handlers.me);
++
++  return router;
++};
+diff --git a/src/routers/post.ts b/src/routers/post.ts
+index d80388f..01393e6 100644
+--- a/src/routers/post.ts
++++ b/src/routers/post.ts
+@@ -1,12 +1,13 @@
+ import { Router } from "express";
++import type { RequestHandler } from "express";
+ import type { PostHandlers } from "../transport/handlers/post.js";
+ 
+-export const createPostRouter = (handlers: PostHandlers): Router => {
++export const createPostRouter = (handlers: PostHandlers, requireAuth: RequestHandler): Router => {
+   const router = Router();
+ 
+   router.get("/", handlers.getPosts);
+   router.get("/:id", handlers.getPostById);
+-  router.post("/", handlers.createPost);
++  router.post("/", requireAuth, handlers.createPost);
+   router.put("/:id", handlers.updatePost);
+   router.delete("/:id", handlers.deletePost);
+ 
+diff --git a/src/services/auth.ts b/src/services/auth.ts
+new file mode 100644
+index 0000000..9cc0551
+--- /dev/null
++++ b/src/services/auth.ts
+@@ -0,0 +1,50 @@
++import type { UserRepository } from "../domain/user/repository.js";
++import { verifyPassword } from "../utils/password.js";
++import type { AuthService, Tokens, UserInfo } from "./types/auth.js";
++import type { TokenService } from "./types/token.js";
++
++export const createAuthService = (
++  userRepository: UserRepository,
++  tokenService: TokenService,
++): AuthService => {
++  const login = (email: string, password: string): Tokens | undefined => {
++    const user = userRepository.getByEmail(email);
++
++    if (!user || !verifyPassword(password, user.passwordHash)) {
++      return undefined;
++    }
++
++    return {
++      accessToken: tokenService.createAccessToken(user.id),
++      refreshToken: tokenService.createRefreshToken(user.id),
++    };
++  };
++
++  const refresh = (refreshToken: string): Tokens | undefined => {
++    const userId = tokenService.verifyRefreshToken(refreshToken);
++    if (userId === null) {
++      return undefined;
++    }
++
++    const user = userRepository.getById(userId);
++    if (!user) {
++      return undefined;
++    }
++
++    return {
++      accessToken: tokenService.createAccessToken(user.id),
++      refreshToken: tokenService.createRefreshToken(user.id),
++    };
++  };
++
++  const me = (userId: number): UserInfo | undefined => {
++    const user = userRepository.getById(userId);
++    if (!user) {
++      return undefined;
++    }
++
++    return { id: user.id, email: user.email };
++  };
++
++  return { login, refresh, me };
++};
+diff --git a/src/services/token.ts b/src/services/token.ts
+new file mode 100644
+index 0000000..eb3a8f1
+--- /dev/null
++++ b/src/services/token.ts
+@@ -0,0 +1,39 @@
++import jwt from "jsonwebtoken";
++import { config } from "../config.js";
++import type { TokenService } from "./types/token.js";
++
++export const createTokenService = (): TokenService => {
++  const createAccessToken = (userId: number): string => {
++    return jwt.sign({ userId, type: "access" }, config.accessSecret, { expiresIn: config.accessTtl });
++  };
++
++  const createRefreshToken = (userId: number): string => {
++    return jwt.sign({ userId, type: "refresh" }, config.refreshSecret, { expiresIn: config.refreshTtl });
++  };
++
++  const verifyAccessToken = (token: string): number | null => {
++    try {
++      const payload = jwt.verify(token, config.accessSecret);
++      if (typeof payload === "string" || payload.type !== "access") {
++        return null;
++      }
++      return payload.userId;
++    } catch {
++      return null;
++    }
++  };
++
++  const verifyRefreshToken = (token: string): number | null => {
++    try {
++      const payload = jwt.verify(token, config.refreshSecret);
++      if (typeof payload === "string" || payload.type !== "refresh") {
++        return null;
++      }
++      return payload.userId;
++    } catch {
++      return null;
++    }
++  };
++
++  return { createAccessToken, createRefreshToken, verifyAccessToken, verifyRefreshToken };
++};
+diff --git a/src/services/types/auth.ts b/src/services/types/auth.ts
+new file mode 100644
+index 0000000..a02f184
+--- /dev/null
++++ b/src/services/types/auth.ts
+@@ -0,0 +1,15 @@
++export type Tokens = {
++  accessToken: string;
++  refreshToken: string;
++};
++
++export type UserInfo = {
++  id: number;
++  email: string;
++};
++
++export interface AuthService {
++  login(email: string, password: string): Tokens | undefined;
++  refresh(refreshToken: string): Tokens | undefined;
++  me(userId: number): UserInfo | undefined;
++}
+diff --git a/src/services/types/token.ts b/src/services/types/token.ts
+new file mode 100644
+index 0000000..2fc0c24
+--- /dev/null
++++ b/src/services/types/token.ts
+@@ -0,0 +1,6 @@
++export interface TokenService {
++  createAccessToken(userId: number): string;
++  createRefreshToken(userId: number): string;
++  verifyAccessToken(token: string): number | null;
++  verifyRefreshToken(token: string): number | null;
++}
+diff --git a/src/transport/dto/auth.ts b/src/transport/dto/auth.ts
+new file mode 100644
+index 0000000..83fe445
+--- /dev/null
++++ b/src/transport/dto/auth.ts
+@@ -0,0 +1,4 @@
++export type LoginDto = {
++  email: string;
++  password: string;
++};
+diff --git a/src/transport/dto/post.ts b/src/transport/dto/post.ts
+index 3a6fff5..92082aa 100644
+--- a/src/transport/dto/post.ts
++++ b/src/transport/dto/post.ts
+@@ -1,6 +1,9 @@
+ export type CreatePostDto = {
+   title: string;
+   content: string;
+-  author: string;
+   category: string;
+ };
++
++export type UpdatePostDto = CreatePostDto & {
++  authorId: number;
++};
+diff --git a/src/transport/handlers/auth.ts b/src/transport/handlers/auth.ts
+new file mode 100644
+index 0000000..ada8aed
+--- /dev/null
++++ b/src/transport/handlers/auth.ts
+@@ -0,0 +1,79 @@
++import type { Request, Response } from "express";
++import { config } from "../../config.js";
++import type { AuthService, Tokens } from "../../services/types/auth.js";
++import type { LoginDto } from "../dto/auth.js";
++
++export type AuthHandlers = {
++  login: (req: Request, res: Response) => void;
++  refresh: (req: Request, res: Response) => void;
++  me: (req: Request, res: Response) => void;
++};
++
++const setCookies = (res: Response, tokens: Tokens) => {
++  res.cookie("accessToken", tokens.accessToken, {
++    httpOnly: true,
++    secure: config.isProduction,
++    sameSite: "strict",
++    maxAge: config.accessTtl * 1000,
++  });
++
++  res.cookie("refreshToken", tokens.refreshToken, {
++    httpOnly: true,
++    secure: config.isProduction,
++    sameSite: "strict",
++    maxAge: config.refreshTtl * 1000,
++  });
++};
++
++export const createAuthHandlers = (service: AuthService): AuthHandlers => {
++  const login = (req: Request, res: Response) => {
++    const { email, password } = (req.body ?? {}) as Partial<LoginDto>;
++
++    if (typeof email !== "string" || typeof password !== "string") {
++      res.status(422).json({ message: "email and password must be strings" });
++      return;
++    }
++
++    const tokens = service.login(email.trim().toLowerCase(), password);
++
++    if (!tokens) {
++      res.status(401).json({ message: "Invalid email or password" });
++      return;
++    }
++
++    setCookies(res, tokens);
++    res.status(200).json({ message: "Logged in" });
++  };
++
++  const refresh = (req: Request, res: Response) => {
++    const refreshToken = req.cookies?.refreshToken;
++
++    if (typeof refreshToken !== "string") {
++      res.status(401).json({ message: "Refresh token is missing" });
++      return;
++    }
++
++    const tokens = service.refresh(refreshToken);
++
++    if (!tokens) {
++      res.status(401).json({ message: "Invalid refresh token" });
++      return;
++    }
++
++    setCookies(res, tokens);
++    res.status(200).json({ message: "Tokens refreshed" });
++  };
++
++  const me = (req: Request, res: Response) => {
++    const user = service.me(res.locals.userId);
++
++    if (!user) {
++      res.status(401).json({ message: "User not found" });
++      return;
++    }
++
++    res.status(200).json(user);
++  };
++
++  return { login, refresh, me };
++};
+diff --git a/src/transport/handlers/post.ts b/src/transport/handlers/post.ts
+index d9fd2d5..978b571 100644
+--- a/src/transport/handlers/post.ts
++++ b/src/transport/handlers/post.ts
+@@ -1,6 +1,6 @@
+ import type { Request, Response } from "express";
+ import type { Service } from "../../services/types/post.js";
+-import type { CreatePostDto } from "../dto/post.js";
++import type { CreatePostDto, UpdatePostDto } from "../dto/post.js";
+ 
+ export type PostHandlers = {
+   getPosts: (req: Request, res: Response) => void;
+@@ -13,15 +13,10 @@ export type PostHandlers = {
+ // Проверяет данные поста. Возвращает текст ошибки или null, если всё хорошо.
+ // Используется и при создании, и при изменении поста.
+ const validatePostData = (body: Partial<CreatePostDto> | undefined): string | null => {
+-  const { title, content, author, category } = body ?? {};
+-
+-  if (
+-    typeof title !== "string" ||
+-    typeof content !== "string" ||
+-    typeof author !== "string" ||
+-    typeof category !== "string"
+-  ) {
+-    return "title, content, author and category must be strings";
++  const { title, content, category } = body ?? {};
++
++  if (typeof title !== "string" || typeof content !== "string" || typeof category !== "string") {
++    return "title, content and category must be strings";
+   }
+ 
+   if (title.trim() === "" || content.trim() === "") {
+@@ -75,8 +70,9 @@ export const createPostHandlers = (service: Service): PostHandlers => {
+       return;
+     }
+ 
+-    const { title, content, author, category } = req.body as CreatePostDto;
+-    const newPost = service.createPost({ title, content, author, category });
++    const authorId = res.locals.userId as number;
++    const { title, content, category } = req.body as CreatePostDto;
++    const newPost = service.createPost({ title, content, category, authorId });
+     res.status(201).json(newPost);
+   };
+ 
+@@ -95,8 +91,14 @@ export const createPostHandlers = (service: Service): PostHandlers => {
+       return;
+     }
+ 
+-    const { title, content, author, category } = req.body as CreatePostDto;
+-    const updatedPost = service.updatePost(id, { title, content, author, category });
++    const { title, content, category, authorId } = req.body as UpdatePostDto;
++
++    if (!Number.isInteger(authorId) || authorId <= 0) {
++      res.status(422).json({ message: "authorId must be a positive number" });
++      return;
++    }
++
++    const updatedPost = service.updatePost(id, { title, content, category, authorId });
+ 
+     if (!updatedPost) {
+       res.status(404).json({ message: "Post not found" });
+diff --git a/src/transport/middleware/requireAuth.ts b/src/transport/middleware/requireAuth.ts
+new file mode 100644
+index 0000000..5858283
+--- /dev/null
++++ b/src/transport/middleware/requireAuth.ts
+@@ -0,0 +1,23 @@
++import type { NextFunction, Request, RequestHandler, Response } from "express";
++import type { TokenService } from "../../services/types/token.js";
++
++export const createRequireAuth = (tokenService: TokenService): RequestHandler => {
++  return (req: Request, res: Response, next: NextFunction) => {
++    const token = req.cookies?.accessToken;
++
++    if (typeof token !== "string") {
++      res.status(401).json({ message: "Access token is missing" });
++      return;
++    }
++
++    const userId = tokenService.verifyAccessToken(token);
++
++    if (userId === null) {
++      res.status(401).json({ message: "Invalid access token" });
++      return;
++    }
++
++    res.locals.userId = userId;
++    next();
++  };
++};
+diff --git a/src/utils/password.ts b/src/utils/password.ts
+new file mode 100644
+index 0000000..9103009
+--- /dev/null
++++ b/src/utils/password.ts
+@@ -0,0 +1,17 @@
++import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
++
++export const hashPassword = (password: string): string => {
++  const salt = randomBytes(16).toString("hex");
++  const hash = scryptSync(password, salt, 64).toString("hex");
++  return salt + ":" + hash;
++};
++
++export const verifyPassword = (password: string, saved: string): boolean => {
++  const [salt, hash] = saved.split(":");
++  if (!salt || !hash) {
++    return false;
++  }
++
++  const newHash = scryptSync(password, salt, 64);
++  return timingSafeEqual(Buffer.from(hash, "hex"), newHash);
++};
+-- 
+2.43.0
+
